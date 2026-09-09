@@ -169,6 +169,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"صار خطأ: {e}")
         return
 
+    if is_admin(update) and caption.startswith("/sendgroup"):
+        parts = caption[len("/sendgroup"):].strip().split(maxsplit=1)
+        if len(parts) < 2:
+            await update.message.reply_text("لازم تكتب: /sendgroup <chat_id> <نص التحدي> بنفس الرسالة.")
+            return
+        try:
+            target_chat = int(parts[0])
+            text = parts[1]
+            await context.bot.send_photo(target_chat, photo=file_id, caption="🔥 تحدي جديد!\n\n" + text)
+            await update.message.reply_text("تم إرسال التحدي للمجموعة بالصورة ✅")
+        except Exception as e:
+            await update.message.reply_text(f"صار خطأ: {e}")
+        return
+
     # ====== حالة: مستخدم يرسل صورة إثبات ======
     user = get_user(update.effective_user.id)
     if not user:
@@ -183,8 +197,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if ADMIN_ID:
-        admin_caption = f"📸 إثبات جديد من {user['name']} (ID: {user['user_id']})\nنقاط تلقائية: +{AUTO_POINTS_ON_SUBMIT}"
-        await context.bot.send_photo(ADMIN_ID, photo=file_id, caption=admin_caption)
+        caption = f"📸 إثبات جديد من {user['name']} (ID: {user['user_id']})\nنقاط تلقائية: +{AUTO_POINTS_ON_SUBMIT}"
+        await context.bot.send_photo(ADMIN_ID, photo=file_id, caption=caption)
 
 # ============ أوامر الأدمن ============
 def is_admin(update: Update):
@@ -262,7 +276,27 @@ async def challenge_to_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"صار خطأ: {e}")
 
-# ============ سيرفر بسيط عشان Render يعتبر الخدمة شغالة (Web Service) ============
+async def group_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أي عضو يكتبه داخل مجموعة -> يطلع رقم المجموعة (chat_id)"""
+    chat = update.effective_chat
+    await update.message.reply_text(f"معرف هذه المحادثة (Chat ID):\n`{chat.id}`", parse_mode="Markdown")
+
+async def send_to_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الاستخدام: /sendgroup <chat_id> <نص> -> يرسل لأي مجموعة البوت عضو فيها"""
+    if not is_admin(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("الاستخدام: /sendgroup <chat_id> <نص التحدي>")
+        return
+    try:
+        chat_id = int(context.args[0])
+        text = "🔥 تحدي جديد!\n\n" + " ".join(context.args[1:])
+        await context.bot.send_message(chat_id, text)
+        await update.message.reply_text("تم الإرسال للمجموعة ✅")
+    except Exception as e:
+        await update.message.reply_text(f"صار خطأ: {e}")
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -302,6 +336,8 @@ def main():
     app.add_handler(CommandHandler("setpoints", set_points_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("challenge", challenge_to_cmd))
+    app.add_handler(CommandHandler("groupid", group_id_cmd))
+    app.add_handler(CommandHandler("sendgroup", send_to_group_cmd))
 
     logger.info("Bot is running...")
     app.run_polling()
