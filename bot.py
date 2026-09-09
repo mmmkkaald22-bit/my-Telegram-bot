@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -129,13 +131,50 @@ async def my_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"نقاطك: {user['points']} 🏆")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """المستخدم يرسل صورة كإثبات إنجاز تحدي -> نقاط تلقائية + إشعار للأدمن"""
+    """
+    لو الأدمن أرسل صورة مع كابشن يبدأ بـ /broadcast أو /challenge -> يوزع التحدي بالصورة
+    غير كذا: يعتبرها المستخدم صورة إثبات -> نقاط تلقائية + إشعار للأدمن
+    """
+    caption = (update.message.caption or "").strip()
+    file_id = update.message.photo[-1].file_id
+
+    # ====== حالة: الأدمن يرسل تحدي مع صورة ======
+    if is_admin(update) and caption.startswith("/broadcast"):
+        text = caption[len("/broadcast"):].strip()
+        if not text:
+            await update.message.reply_text("لازم تكتب نص التحدي بعد /broadcast بنفس الرسالة.")
+            return
+        users = get_all_users()
+        sent = 0
+        for u in users:
+            try:
+                await context.bot.send_photo(u["user_id"], photo=file_id, caption="🔥 تحدي جديد!\n\n" + text)
+                sent += 1
+            except Exception:
+                pass
+        await update.message.reply_text(f"تم إرسال التحدي بالصورة لـ {sent} شخص.")
+        return
+
+    if is_admin(update) and caption.startswith("/challenge"):
+        parts = caption[len("/challenge"):].strip().split(maxsplit=1)
+        if len(parts) < 2:
+            await update.message.reply_text("لازم تكتب: /challenge <user_id> <نص التحدي> بنفس الرسالة.")
+            return
+        try:
+            target_id = int(parts[0])
+            text = parts[1]
+            await context.bot.send_photo(target_id, photo=file_id, caption="🔥 تحدي جديد لك!\n\n" + text)
+            await update.message.reply_text("تم إرسال التحدي بالصورة ✅")
+        except Exception as e:
+            await update.message.reply_text(f"صار خطأ: {e}")
+        return
+
+    # ====== حالة: مستخدم يرسل صورة إثبات ======
     user = get_user(update.effective_user.id)
     if not user:
         await update.message.reply_text("سجّل أول بـ /start")
         return
 
-    file_id = update.message.photo[-1].file_id
     add_points(user["user_id"], AUTO_POINTS_ON_SUBMIT)
     log_submission(user["user_id"], file_id, AUTO_POINTS_ON_SUBMIT)
 
@@ -144,8 +183,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if ADMIN_ID:
-        caption = f"📸 إثبات جديد من {user['name']} (ID: {user['user_id']})\nنقاط تلقائية: +{AUTO_POINTS_ON_SUBMIT}"
-        await context.bot.send_photo(ADMIN_ID, photo=file_id, caption=caption)
+        admin_caption = f"📸 إثبات جديد من {user['name']} (ID: {user['user_id']})\nنقاط تلقائية: +{AUTO_POINTS_ON_SUBMIT}"
+        await context.bot.send_photo(ADMIN_ID, photo=file_id, caption=admin_caption)
 
 # ============ أوامر الأدمن ============
 def is_admin(update: Update):
@@ -223,11 +262,27 @@ async def challenge_to_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"صار خطأ: {e}")
 
+# ============ سيرفر بسيط عشان Render يعتبر الخدمة شغالة (Web Service) ============
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+    def log_message(self, format, *args):
+        pass  # تجاهل سجلات الطلبات حتى ما تزحم الـ logs
+
+def run_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    server.serve_forever()
+
 # ============ التشغيل ============
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("لازم تحط BOT_TOKEN كمتغير بيئة")
     init_db()
+
+    threading.Thread(target=run_health_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
