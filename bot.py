@@ -1,9 +1,11 @@
 import os
-import sqlite3
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
+
+import psycopg2
+import psycopg2.extras
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,33 +19,32 @@ logger = logging.getLogger(__name__)
 # ============ الإعدادات ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-DB_PATH = os.environ.get("DB_PATH", "bot_data.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 AUTO_POINTS_ON_SUBMIT = 5  # نقاط تلقائية عند إرسال صورة إثبات
 
 WAITING_NAME = 1
 
-# ============ قاعدة البيانات ============
+# ============ قاعدة البيانات (Supabase / Postgres دائمة) ============
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
     conn = get_conn()
-    conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             name TEXT,
             username TEXT,
-            chat_id INTEGER,
+            chat_id BIGINT,
             points INTEGER DEFAULT 0,
             joined_at TEXT
         )
     """)
-    conn.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS submissions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             file_id TEXT,
             points_given INTEGER,
             reviewed INTEGER DEFAULT 0,
@@ -51,56 +52,80 @@ def init_db():
         )
     """)
     conn.commit()
+    cur.close()
     conn.close()
 
 def upsert_user(user_id, name, username, chat_id):
     conn = get_conn()
-    row = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users WHERE user_id=%s", (user_id,))
+    row = cur.fetchone()
     if row:
-        conn.execute("UPDATE users SET name=?, username=?, chat_id=? WHERE user_id=?",
+        cur.execute("UPDATE users SET name=%s, username=%s, chat_id=%s WHERE user_id=%s",
                      (name, username, chat_id, user_id))
     else:
-        conn.execute(
-            "INSERT INTO users (user_id, name, username, chat_id, points, joined_at) VALUES (?,?,?,?,0,?)",
+        cur.execute(
+            "INSERT INTO users (user_id, name, username, chat_id, points, joined_at) VALUES (%s,%s,%s,%s,0,%s)",
             (user_id, name, username, chat_id, datetime.utcnow().isoformat())
         )
     conn.commit()
+    cur.close()
     conn.close()
 
 def add_points(user_id, delta):
     conn = get_conn()
-    conn.execute("UPDATE users SET points = points + ? WHERE user_id=?", (delta, user_id))
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET points = points + %s WHERE user_id=%s", (delta, user_id))
     conn.commit()
+    cur.close()
     conn.close()
 
 def set_points(user_id, value):
     conn = get_conn()
-    conn.execute("UPDATE users SET points = ? WHERE user_id=?", (value, user_id))
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET points = %s WHERE user_id=%s", (value, user_id))
     conn.commit()
+    cur.close()
     conn.close()
 
 def get_user(user_id):
     conn = get_conn()
-    row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM users WHERE user_id=%s", (user_id,))
+    row = cur.fetchone()
+    cur.close()
     conn.close()
     return row
 
 def get_all_users():
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM users ORDER BY points DESC").fetchall()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM users ORDER BY points DESC")
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return rows
 
+def delete_user(user_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
 def log_submission(user_id, file_id, points_given):
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO submissions (user_id, file_id, points_given, created_at) VALUES (?,?,?,?)",
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO submissions (user_id, file_id, points_given, created_at) VALUES (%s,%s,%s,%s)",
         (user_id, file_id, points_given, datetime.utcnow().isoformat())
     )
     conn.commit()
+    cur.close()
     conn.close()
 
-# ============ أوامر المستخدم ============
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     existing = get_user(user.id)
@@ -276,7 +301,25 @@ async def challenge_to_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"صار خطأ: {e}")
 
-async def group_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def delete_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الاستخدام: /deleteuser <user_id> -> يحذف مستخدم من القائمة"""
+    if not is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("الاستخدام: /deleteuser <user_id>")
+        return
+    try:
+        user_id = int(context.args[0])
+        u = get_user(user_id)
+        if not u:
+            await update.message.reply_text("ما فيه مستخدم بهذا الرقم.")
+            return
+        delete_user(user_id)
+        await update.message.reply_text(f"تم حذف {u['name']} ✅")
+    except Exception as e:
+        await update.message.reply_text(f"صار خطأ: {e}")
+
+
     """أي عضو يكتبه داخل مجموعة -> يطلع رقم المجموعة (chat_id)"""
     chat = update.effective_chat
     await update.message.reply_text(f"معرف هذه المحادثة (Chat ID):\n`{chat.id}`", parse_mode="Markdown")
@@ -314,6 +357,8 @@ def run_health_server():
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("لازم تحط BOT_TOKEN كمتغير بيئة")
+    if not DATABASE_URL:
+        raise RuntimeError("لازم تحط DATABASE_URL كمتغير بيئة (رابط قاعدة بيانات Supabase)")
     init_db()
 
     threading.Thread(target=run_health_server, daemon=True).start()
@@ -338,6 +383,7 @@ def main():
     app.add_handler(CommandHandler("challenge", challenge_to_cmd))
     app.add_handler(CommandHandler("groupid", group_id_cmd))
     app.add_handler(CommandHandler("sendgroup", send_to_group_cmd))
+    app.add_handler(CommandHandler("deleteuser", delete_user_cmd))
 
     logger.info("Bot is running...")
     app.run_polling()
