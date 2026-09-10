@@ -51,6 +51,15 @@ def init_db():
             created_at TEXT
         )
     """)
+    # جدول الأسئلة / التحديات مع عدد النقاط الخاص بكل واحد
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS challenges (
+            id SERIAL PRIMARY KEY,
+            question TEXT,
+            points INTEGER DEFAULT 0,
+            created_at TEXT
+        )
+    """)
     conn.commit()
     cur.close()
     conn.close()
@@ -121,6 +130,54 @@ def log_submission(user_id, file_id, points_given):
         "INSERT INTO submissions (user_id, file_id, points_given, created_at) VALUES (%s,%s,%s,%s)",
         (user_id, file_id, points_given, datetime.utcnow().isoformat())
     )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# ============ إدارة الأسئلة / التحديات ونقاطها ============
+def add_challenge(question, points):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO challenges (question, points, created_at) VALUES (%s,%s,%s) RETURNING id",
+        (question, points, datetime.utcnow().isoformat())
+    )
+    new_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return new_id
+
+def get_all_challenges():
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM challenges ORDER BY id ASC")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+def get_challenge(challenge_id):
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM challenges WHERE id=%s", (challenge_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+def delete_challenge(challenge_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM challenges WHERE id=%s", (challenge_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def update_challenge_points(challenge_id, points):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE challenges SET points=%s WHERE id=%s", (points, challenge_id))
     conn.commit()
     cur.close()
     conn.close()
@@ -255,6 +312,23 @@ async def add_points_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("الاستخدام: /addpoints <user_id> <عدد_النقاط>")
 
+async def remove_points_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الاستخدام: /removepoints <user_id> <عدد النقاط> -> يخصم نقاط من العضو"""
+    if not is_admin(update):
+        return
+    try:
+        user_id = int(context.args[0])
+        delta = int(context.args[1])
+        u = get_user(user_id)
+        if not u:
+            await update.message.reply_text("ما فيه مستخدم بهذا الرقم.")
+            return
+        add_points(user_id, -abs(delta))
+        u = get_user(user_id)
+        await update.message.reply_text(f"تم الخصم. نقاط {u['name']} الآن: {u['points']}")
+    except Exception:
+        await update.message.reply_text("الاستخدام: /removepoints <user_id> <عدد_النقاط>")
+
 async def set_points_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """الاستخدام: /setpoints <user_id> <عدد النقاط>"""
     if not is_admin(update):
@@ -267,6 +341,79 @@ async def set_points_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"تم. نقاط {u['name']} الآن: {u['points']}")
     except Exception:
         await update.message.reply_text("الاستخدام: /setpoints <user_id> <عدد_النقاط>")
+
+async def reset_points_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الاستخدام: /resetpoints <user_id> -> يصفّر نقاط العضو"""
+    if not is_admin(update):
+        return
+    try:
+        user_id = int(context.args[0])
+        u = get_user(user_id)
+        if not u:
+            await update.message.reply_text("ما فيه مستخدم بهذا الرقم.")
+            return
+        set_points(user_id, 0)
+        await update.message.reply_text(f"تم تصفير نقاط {u['name']} ✅")
+    except Exception:
+        await update.message.reply_text("الاستخدام: /resetpoints <user_id>")
+
+# ============ أوامر الأسئلة / التحديات ونقاطها ============
+async def add_challenge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الاستخدام: /addchallenge <عدد_النقاط> <نص السؤال أو التحدي>"""
+    if not is_admin(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("الاستخدام: /addchallenge <عدد_النقاط> <نص السؤال>")
+        return
+    try:
+        points = int(context.args[0])
+        question = " ".join(context.args[1:])
+        new_id = add_challenge(question, points)
+        await update.message.reply_text(f"✅ تمت الإضافة (#{new_id})\nالسؤال: {question}\nالنقاط: {points}")
+    except ValueError:
+        await update.message.reply_text("عدد النقاط لازم يكون رقم. الاستخدام: /addchallenge <عدد_النقاط> <نص السؤال>")
+
+async def list_challenges_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعرض كل الأسئلة/التحديات مع نقاطها"""
+    challenges = get_all_challenges()
+    if not challenges:
+        await update.message.reply_text("ما فيه أسئلة/تحديات مضافة لسا.")
+        return
+    text = "📚 الأسئلة والتحديات:\n\n"
+    for c in challenges:
+        text += f"#{c['id']} ({c['points']} نقطة)\n{c['question']}\n\n"
+    await update.message.reply_text(text)
+
+async def edit_challenge_points_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الاستخدام: /editchallenge <id> <عدد_النقاط_الجديد>"""
+    if not is_admin(update):
+        return
+    try:
+        challenge_id = int(context.args[0])
+        points = int(context.args[1])
+        c = get_challenge(challenge_id)
+        if not c:
+            await update.message.reply_text("ما فيه سؤال بهذا الرقم.")
+            return
+        update_challenge_points(challenge_id, points)
+        await update.message.reply_text(f"✅ تم تعديل نقاط السؤال #{challenge_id} إلى {points}")
+    except Exception:
+        await update.message.reply_text("الاستخدام: /editchallenge <id> <عدد_النقاط_الجديد>")
+
+async def delete_challenge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الاستخدام: /delchallenge <id>"""
+    if not is_admin(update):
+        return
+    try:
+        challenge_id = int(context.args[0])
+        c = get_challenge(challenge_id)
+        if not c:
+            await update.message.reply_text("ما فيه سؤال بهذا الرقم.")
+            return
+        delete_challenge(challenge_id)
+        await update.message.reply_text(f"🗑️ تم حذف السؤال #{challenge_id}")
+    except Exception:
+        await update.message.reply_text("الاستخدام: /delchallenge <id>")
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """الاستخدام: /broadcast <نص التحدي> -> يرسل للجميع"""
@@ -319,7 +466,7 @@ async def delete_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"صار خطأ: {e}")
 
-
+async def group_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أي عضو يكتبه داخل مجموعة -> يطلع رقم المجموعة (chat_id)"""
     chat = update.effective_chat
     await update.message.reply_text(f"معرف هذه المحادثة (Chat ID):\n`{chat.id}`", parse_mode="Markdown")
@@ -375,15 +522,25 @@ def main():
     app.add_handler(CommandHandler("points", my_points))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # أوامر الأدمن
+    # أوامر الأدمن - إدارة الأعضاء والنقاط
     app.add_handler(CommandHandler("users", list_users))
     app.add_handler(CommandHandler("addpoints", add_points_cmd))
+    app.add_handler(CommandHandler("removepoints", remove_points_cmd))
     app.add_handler(CommandHandler("setpoints", set_points_cmd))
+    app.add_handler(CommandHandler("resetpoints", reset_points_cmd))
+    app.add_handler(CommandHandler("deleteuser", delete_user_cmd))
+
+    # أوامر الأسئلة / التحديات ونقاطها
+    app.add_handler(CommandHandler("addchallenge", add_challenge_cmd))
+    app.add_handler(CommandHandler("challenges", list_challenges_cmd))
+    app.add_handler(CommandHandler("editchallenge", edit_challenge_points_cmd))
+    app.add_handler(CommandHandler("delchallenge", delete_challenge_cmd))
+
+    # أوامر البث والإرسال
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("challenge", challenge_to_cmd))
     app.add_handler(CommandHandler("groupid", group_id_cmd))
     app.add_handler(CommandHandler("sendgroup", send_to_group_cmd))
-    app.add_handler(CommandHandler("deleteuser", delete_user_cmd))
 
     logger.info("Bot is running...")
     app.run_polling()
